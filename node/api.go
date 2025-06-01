@@ -68,12 +68,7 @@ func (n *RaftNode) SubmitCommand(command interface{}) error {
 func (n *RaftNode) GetStateMachine() map[string]interface{} {
     n.mu.RLock()
     defer n.mu.RUnlock()
-    
-    result := make(map[string]interface{})
-    for k, v := range n.stateMachine {
-        result[k] = v
-    }
-    return result
+    return n.stateMachine.GetAll()
 }
 
 // GetCommitIndex returns the current commit index

@@ -8,6 +8,21 @@ import (
 	"github.com/saiweb3dev/distributed_consensus_simulator/types"
 )
 
+// Set log level - only important events
+var LogLevel = 1 // 0=silent, 1=important, 2=verbose
+
+func logImportant(format string, args ...interface{}) {
+    if LogLevel >= 1 {
+        log.Printf(format, args...)
+    }
+}
+
+func logVerbose(format string, args ...interface{}) {
+    if LogLevel >= 2 {
+        log.Printf(format, args...)
+    }
+}
+
 // Common errors
 var (
 	ErrNotLeader = errors.New("node is not the leader")
@@ -33,7 +48,7 @@ func (n *RaftNode) becomeLeader() {
     // Send immediate heartbeat to establish leadership
     n.sendHeartbeats()
     
-    log.Printf("Node %d became leader for term %d", n.id, n.currentTerm)
+    logImportant("🔴 Node %d became LEADER for term %d", n.id, n.currentTerm)
 }
 
 // appendLogEntry adds a new entry to the log
@@ -44,7 +59,7 @@ func (n *RaftNode) appendLogEntry(command interface{}) int {
         Command: command,
     }
     n.log = append(n.log, entry)
-    log.Printf("Node %d appended log entry at index %d: %v", n.id, entry.Index, command)
+logVerbose("📝 Node %d appended entry[%d]: %v", n.id, entry.Index, command)
     return entry.Index
 }
 
@@ -101,7 +116,7 @@ func (n *RaftNode) replicateToFollower(followerID int) {
 
 // updateCommitIndex updates the commit index based on majority replication
 func (n *RaftNode) updateCommitIndex() {
-    if n.state != types.Leader {
+     if n.state != types.Leader {
         return
     }
     
@@ -121,10 +136,8 @@ func (n *RaftNode) updateCommitIndex() {
         
         majority := (len(n.peers)+1)/2 + 1
         if replicaCount >= majority {
-            oldCommitIndex := n.commitIndex
             n.commitIndex = i
-            log.Printf("Leader %d updated commit index from %d to %d", 
-                n.id, oldCommitIndex, n.commitIndex)
+            logImportant("📊 Leader %d committed entries up to index %d", n.id, n.commitIndex)
             
             // Apply newly committed entries
             n.applyCommittedEntries()
@@ -140,20 +153,20 @@ func (n *RaftNode) applyCommittedEntries() {
         entry := n.log[n.lastApplied]
         
         // Apply to state machine
-        if cmd, ok := entry.Command.(map[string]interface{}); ok {
-            if op, exists := cmd["op"]; exists && op == "set" {
-                if key, keyOk := cmd["key"].(string); keyOk {
-                    if value, valueOk := cmd["value"]; valueOk {
-                        n.stateMachine[key] = value
-                        log.Printf("Node %d applied: SET %s = %v", n.id, key, value)
-                    }
-                }
-            }
+        err := n.stateMachine.Apply(entry.Command)
+        if err != nil {
+            logImportant("❌ Node %d failed to apply entry[%d]: %v", n.id, n.lastApplied, err)
+        } else {
+            logImportant("✅ Node %d applied entry[%d]", n.id, n.lastApplied)
         }
         
         // Notify pending client if this was our command
         if respCh, exists := n.pendingCommands[n.lastApplied]; exists {
-            close(respCh)
+            if err != nil {
+                respCh <- err
+            } else {
+                close(respCh)
+            }
             delete(n.pendingCommands, n.lastApplied)
         }
     }

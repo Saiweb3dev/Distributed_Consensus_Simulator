@@ -7,12 +7,26 @@ import (
 	"log"
 	"sync"
 	"time"
+	"errors"
+	"fmt"
 	"github.com/saiweb3dev/distributed_consensus_simulator/types"
 )
 
 // MessageRouter interface for sending messages
 type MessageRouter interface {
 	RouteMessage(msg types.Message)
+}
+
+// StateMachine handles state transitions
+type StateMachine struct {
+    data map[string]interface{}
+}
+
+// NewStateMachine creates a new state machine
+func NewStateMachine() *StateMachine {
+    return &StateMachine{
+        data: make(map[string]interface{}),
+    }
 }
 
 // RaftNode represents a single node in the Raft cluster
@@ -52,8 +66,183 @@ type RaftNode struct {
 	lastHeartbeat   time.Time
 
 	// Add for log replication
-    stateMachine map[string]interface{} // Simple key-value state machine
+   stateMachine    *StateMachine // Simple key-value state machine
     pendingCommands map[int]chan error  // Track pending client commands
+}
+
+// Apply applies a command to the state machine
+func (sm *StateMachine) Apply(command interface{}) error {
+    cmd, ok := command.(map[string]interface{})
+    if !ok {
+        return errors.New("invalid command format")
+    }
+
+    cmdType, exists := cmd["type"]
+    if !exists {
+        cmdType = cmd["Type"] // Handle struct field
+    }
+
+    switch cmdType {
+    case "SET":
+        return sm.handleSet(cmd)
+    case "CREATE_ACCOUNT":
+        return sm.handleCreateAccount(cmd)
+    case "TRANSFER":
+        return sm.handleTransfer(cmd)
+    default:
+        return fmt.Errorf("unknown command type: %v", cmdType)
+    }
+}
+
+// handleSet handles SET operations
+func (sm *StateMachine) handleSet(cmd map[string]interface{}) error {
+    key, keyOk := getStringField(cmd, "key", "Key")
+    value, valueOk := getField(cmd, "value", "Value")
+    
+    if !keyOk || !valueOk {
+        return errors.New("SET: missing key or value")
+    }
+
+    sm.data[key] = value
+    return nil
+}
+
+// handleCreateAccount handles account creation
+func (sm *StateMachine) handleCreateAccount(cmd map[string]interface{}) error {
+    accountID, ok := getStringField(cmd, "key", "Key")
+    if !ok {
+        return errors.New("CREATE_ACCOUNT: missing account ID")
+    }
+
+    amount, ok := getFloatField(cmd, "amount", "Amount")
+    if !ok {
+        return errors.New("CREATE_ACCOUNT: missing initial amount")
+    }
+
+    balanceKey := "balance_" + accountID
+    if _, exists := sm.data[balanceKey]; exists {
+        return fmt.Errorf("account %s already exists", accountID)
+    }
+
+    sm.data[balanceKey] = amount
+    sm.data["account_"+accountID] = map[string]interface{}{
+        "created_at": fmt.Sprintf("%d", getCurrentTimestamp()),
+        "status":     "active",
+    }
+
+    return nil
+}
+
+// handleTransfer handles money transfers
+func (sm *StateMachine) handleTransfer(cmd map[string]interface{}) error {
+    from, fromOk := getStringField(cmd, "from", "From")
+    to, toOk := getStringField(cmd, "to", "To")
+    amount, amountOk := getFloatField(cmd, "amount", "Amount")
+
+    if !fromOk || !toOk || !amountOk {
+        return errors.New("TRANSFER: missing required fields")
+    }
+
+    if amount <= 0 {
+        return errors.New("TRANSFER: amount must be positive")
+    }
+
+    fromBalanceKey := "balance_" + from
+    toBalanceKey := "balance_" + to
+
+    // Check if accounts exist
+    fromBalance, fromExists := sm.data[fromBalanceKey]
+    toBalance, toExists := sm.data[toBalanceKey]
+
+    if !fromExists {
+        return fmt.Errorf("account %s does not exist", from)
+    }
+    if !toExists {
+        return fmt.Errorf("account %s does not exist", to)
+    }
+
+    // Convert to float64
+    fromBal, ok := fromBalance.(float64)
+    if !ok {
+        return fmt.Errorf("invalid balance format for account %s", from)
+    }
+
+    toBal, ok := toBalance.(float64)
+    if !ok {
+        return fmt.Errorf("invalid balance format for account %s", to)
+    }
+
+    // Check sufficient funds
+    if fromBal < amount {
+        return fmt.Errorf("insufficient funds: %s has $%.2f, needs $%.2f", from, fromBal, amount)
+    }
+
+    // Perform transfer
+    sm.data[fromBalanceKey] = fromBal - amount
+    sm.data[toBalanceKey] = toBal + amount
+
+    // Log transaction
+    txnKey := fmt.Sprintf("txn_%d", getCurrentTimestamp())
+    sm.data[txnKey] = map[string]interface{}{
+        "from":   from,
+        "to":     to,
+        "amount": amount,
+        "type":   "transfer",
+    }
+
+    return nil
+}
+
+// Get retrieves a value from the state machine
+func (sm *StateMachine) Get(key string) (interface{}, bool) {
+    value, exists := sm.data[key]
+    return value, exists
+}
+
+// GetAll returns a copy of all data
+func (sm *StateMachine) GetAll() map[string]interface{} {
+    result := make(map[string]interface{})
+    for k, v := range sm.data {
+        result[k] = v
+    }
+    return result
+}
+
+// Helper functions
+func getField(cmd map[string]interface{}, keys ...string) (interface{}, bool) {
+    for _, key := range keys {
+        if value, exists := cmd[key]; exists {
+            return value, true
+        }
+    }
+    return nil, false
+}
+
+func getStringField(cmd map[string]interface{}, keys ...string) (string, bool) {
+    value, exists := getField(cmd, keys...)
+    if !exists {
+        return "", false
+    }
+    str, ok := value.(string)
+    return str, ok
+}
+
+func getFloatField(cmd map[string]interface{}, keys ...string) (float64, bool) {
+    value, exists := getField(cmd, keys...)
+    if !exists {
+        return 0, false
+    }
+    if f, ok := value.(float64); ok {
+        return f, true
+    }
+    if i, ok := value.(int); ok {
+        return float64(i), true
+    }
+    return 0, false
+}
+
+func getCurrentTimestamp() int64 {
+    return 1000000 + int64(len("dummy")) // Simple timestamp simulation
 }
 
 // NewRaftNode creates a new Raft node
@@ -74,7 +263,7 @@ func NewRaftNode(id int, peers []int, config types.NodeConfig, router MessageRou
         inbox:         make(chan types.Message, 100),
         stopCh:        make(chan struct{}),
         lastHeartbeat: time.Now(),
-				stateMachine:  make(map[string]interface{}),
+				stateMachine:   NewStateMachine(),
         pendingCommands: make(map[int]chan error),
     }
 
@@ -379,7 +568,11 @@ func (n *RaftNode) startElection() {
 	n.votedFor = n.id
 	n.resetElectionTimer()
 	
-	log.Printf("Node %d starting election for term %d", n.id, n.currentTerm)
+	logImportant("🗳️  Node %d starting election for term %d", n.id, n.currentTerm)
+
+	// Reset vote tracking
+    n.votesReceived = make(map[int]bool)
+    n.votesReceived[n.id] = true // Vote for ourselves
 	
 	// Send vote requests to all peers
 	lastLogIndex, lastLogTerm := n.getLastLogInfo()
