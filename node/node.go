@@ -5,11 +5,15 @@ package node
 
 import (
 	"log"
-	"math/rand"
 	"sync"
 	"time"
 	"github.com/saiweb3dev/distributed_consensus_simulator/types"
 )
+
+// MessageRouter interface for sending messages
+type MessageRouter interface {
+	RouteMessage(msg types.Message)
+}
 
 // RaftNode represents a single node in the Raft cluster
 type RaftNode struct {
@@ -35,11 +39,12 @@ type RaftNode struct {
 	state         types.NodeState
 	mu            sync.RWMutex // Protects all shared state
 	currentLeader int          // ID of current leader (-1 if unknown)
+	votesReceived map[int]bool // Track votes received in current election
 
 	// Communication channels
 	inbox  chan types.Message // Incoming messages
-	outbox chan types.Message // Outgoing messages
 	stopCh chan struct{}      // Signal to stop the node
+	router MessageRouter // Router for sending messages
 
 	// Timing
 	electionTimer   *time.Timer
@@ -48,35 +53,41 @@ type RaftNode struct {
 }
 
 // NewRaftNode creates a new Raft node
-func NewRaftNode(id int, peers []int, config types.NodeConfig) *RaftNode {
-	node := &RaftNode{
-		id:            id,
-		peers:         peers,
-		config:        config,
-		currentTerm:   0,
-		votedFor:      -1,
-		log:           make([]types.LogEntry, 0),
-		commitIndex:   -1, // -1 indicates no entries committed yet
-		lastApplied:   -1,
-		state:         types.Follower,
-		currentLeader: -1,
-		inbox:         make(chan types.Message, 100),
-		outbox:        make(chan types.Message, 100),
-		stopCh:        make(chan struct{}),
-		lastHeartbeat: time.Now(),
-	}
+func NewRaftNode(id int, peers []int, config types.NodeConfig, router MessageRouter) *RaftNode {
+    node := &RaftNode{
+        id:            id,
+        peers:         peers,
+        config:        config,
+        router:        router,
+        currentTerm:   0,
+        votedFor:      -1,
+        log:           make([]types.LogEntry, 0),
+        commitIndex:   -1, // -1 indicates no entries committed yet
+        lastApplied:   -1,
+        state:         types.Follower,
+        currentLeader: -1,
+        votesReceived: make(map[int]bool),
+        inbox:         make(chan types.Message, 100),
+        stopCh:        make(chan struct{}),
+        lastHeartbeat: time.Now(),
+    }
 
-	// Initialize leader state
-	peerCount := len(peers) + 1 // +1 for self
-	node.nextIndex = make([]int, peerCount)
-	node.matchIndex = make([]int, peerCount)
+    // Initialize leader state
+    peerCount := len(peers) + 1 // +1 for self
+    node.nextIndex = make([]int, peerCount)
+    node.matchIndex = make([]int, peerCount)
 
-	// Initialize timers
-	node.electionTimer = time.NewTimer(node.randomElectionTimeout())
-	node.heartbeatTicker = time.NewTicker(config.HeartbeatInterval)
-	node.heartbeatTicker.Stop() // Only leaders send heartbeats
+    // Initialize timers
+    node.electionTimer = time.NewTimer(node.randomElectionTimeout())
 
-	return node
+    return node
+}
+
+// sendMessage sends a message through the router
+func (n *RaftNode) sendMessage(msg types.Message) {
+    if n.router != nil {
+        n.router.RouteMessage(msg)
+    }
 }
 
 // Start begins the node's main processing loop
@@ -87,24 +98,31 @@ func (n *RaftNode) Start() {
 
 // messageLoop is the main event loop for processing messages and timeouts
 func (n *RaftNode) messageLoop() {
-	for {
-		select {
-		case msg := <-n.inbox:
-			n.handleMessage(msg)
+    for {
+        select {
+        case msg := <-n.inbox:
+            n.handleMessage(msg)
 
-		case <-n.electionTimer.C:
-			n.handleElectionTimeout()
+        case <-n.electionTimer.C:
+            n.handleElectionTimeout()
 
-		case <-n.heartbeatTicker.C:
-			n.handleHeartbeatTimeout()
+        case <-func() <-chan time.Time {
+            if n.heartbeatTicker != nil {
+                return n.heartbeatTicker.C
+            }
+            return make(chan time.Time) // Return a channel that never receives
+        }():
+            n.handleHeartbeatTimeout()
 
-		case <-n.stopCh:
-			log.Printf("Node %d stopping", n.id)
-			n.electionTimer.Stop()
-			n.heartbeatTicker.Stop()
-			return
-		}
-	}
+        case <-n.stopCh:
+            log.Printf("Node %d stopping", n.id)
+            n.electionTimer.Stop()
+            if n.heartbeatTicker != nil {
+                n.heartbeatTicker.Stop()
+            }
+            return
+        }
+    }
 }
 
 // handleMessage processes incoming messages based on type and current state
@@ -175,27 +193,20 @@ func (n *RaftNode) handleVoteRequest(msg types.Message) {
 
 // handleVoteResponse processes vote responses when we're a candidate
 func (n *RaftNode) handleVoteResponse(msg types.Message) {
-	if n.state != types.Candidate {
-		return
-	}
+    if n.state != types.Candidate {
+        return
+    }
 
-	if msg.VoteGranted {
-		log.Printf("Node %d received vote from Node %d", n.id, msg.From)
-		
-		// Count votes (including our own vote)
-		votes := 1
-		for _, peer := range n.peers {
-			// In a real implementation, we'd track votes received
-			// For now, we'll simulate becoming leader after receiving first vote
-			log.Printf("Node %d checking vote from Node %d", n.id, peer)
-		}
-		
-		// If we have majority, become leader
-		majority := (len(n.peers) + 1) / 2 + 1
-		if votes >= majority {
-			n.becomeLeader()
-		}
-	}
+    if msg.VoteGranted {
+        log.Printf("Node %d received vote from Node %d", n.id, msg.From)
+        n.votesReceived[msg.From] = true
+        
+        // Check if we have majority
+        if n.hasMajority() {
+            log.Printf("Node %d has majority votes, becoming leader", n.id)
+            n.becomeLeader()
+        }
+    }
 }
 
 // handleAppendEntries processes append entries (including heartbeats) from leader
@@ -301,110 +312,4 @@ func (n *RaftNode) startElection() {
 		}
 		n.sendMessage(voteRequest)
 	}
-}
-
-// becomeLeader transitions this node to leader state
-func (n *RaftNode) becomeLeader() {
-	log.Printf("Node %d became leader for term %d", n.id, n.currentTerm)
-	
-	n.state = types.Leader
-	n.currentLeader = n.id
-	
-	// Initialize leader state
-	nextIndex := len(n.log)
-	for i := range n.nextIndex {
-		n.nextIndex[i] = nextIndex
-		n.matchIndex[i] = -1
-	}
-	
-	// Start sending heartbeats
-	n.electionTimer.Stop()
-	n.heartbeatTicker.Reset(n.config.HeartbeatInterval)
-	
-	// Send immediate heartbeat
-	n.sendHeartbeats()
-}
-
-// stepDown converts to follower state
-func (n *RaftNode) stepDown(newTerm int) {
-	log.Printf("Node %d stepping down from %s to Follower (term %d -> %d)", 
-		n.id, n.state, n.currentTerm, newTerm)
-	
-	n.currentTerm = newTerm
-	n.votedFor = -1
-	n.state = types.Follower
-	n.currentLeader = -1
-	
-	n.heartbeatTicker.Stop()
-	n.resetElectionTimer()
-}
-
-
-// sendHeartbeats sends heartbeat messages to all followers
-func (n *RaftNode) sendHeartbeats() {
-	for _, peer := range n.peers {
-		heartbeat := types.Message{
-			Type: types.Heartbeat,
-			From: n.id,
-			To:   peer,
-			Term: n.currentTerm,
-		}
-		n.sendMessage(heartbeat)
-	}
-}
-
-// Helper methods
-func (n *RaftNode) sendMessage(msg types.Message) {
-	select {
-	case n.outbox <- msg:
-	default:
-		log.Printf("Node %d outbox full, dropping message", n.id)
-	}
-}
-
-func (n *RaftNode) getLastLogInfo() (int, int) {
-	if len(n.log) == 0 {
-		return -1, 0
-	}
-	lastEntry := n.log[len(n.log)-1]
-	return lastEntry.Index, lastEntry.Term
-}
-
-func (n *RaftNode) randomElectionTimeout() time.Duration {
-	min := n.config.ElectionTimeoutMin
-	max := n.config.ElectionTimeoutMax
-	return min + time.Duration(rand.Int63n(int64(max-min)))
-}
-
-func (n *RaftNode) resetElectionTimer() {
-	n.electionTimer.Stop()
-	n.electionTimer.Reset(n.randomElectionTimeout())
-}
-
-// Public API methods
-func (n *RaftNode) GetState() (types.NodeState, int, int) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.state, n.currentTerm, n.currentLeader
-}
-
-func (n *RaftNode) SendMessage(msg types.Message) {
-	select {
-	case n.inbox <- msg:
-	default:
-		log.Printf("Node %d inbox full, dropping message", n.id)
-	}
-}
-
-func (n *RaftNode) GetOutboxMessage() (types.Message, bool) {
-	select {
-	case msg := <-n.outbox:
-		return msg, true
-	default:
-		return types.Message{}, false
-	}
-}
-
-func (n *RaftNode) Stop() {
-	close(n.stopCh)
 }

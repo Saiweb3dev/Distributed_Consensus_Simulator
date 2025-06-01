@@ -76,6 +76,19 @@ type Message struct {
 	Success      bool        `json:"success,omitempty"`
 	LeaderCommit int         `json:"leader_commit,omitempty"`
 	Command      interface{} `json:"command,omitempty"`
+
+	// Network simulation fields
+	Timestamp time.Time `json:"timestamp"`
+	Delay     time.Duration `json:"delay,omitempty"`
+}
+
+// NetworkConfig holds network simulation parameters
+type NetworkConfig struct {
+	BaseLatency    time.Duration // Base network latency
+	LatencyJitter  time.Duration // Random latency variation
+	PacketLoss     float64       // Probability of packet loss (0.0 to 1.0)
+	PartitionNodes []int         // Nodes that are partitioned
+	Enabled        bool          // Whether network simulation is enabled
 }
 
 // NodeConfig holds configuration for a Raft node
@@ -94,4 +107,25 @@ func DefaultNodeConfig() NodeConfig {
 		HeartbeatInterval:  50 * time.Millisecond,
 		RequestTimeout:     100 * time.Millisecond,
 	}
+}
+// DefaultNetworkConfig returns default network simulation parameters
+func DefaultNetworkConfig() NetworkConfig {
+    return NetworkConfig{
+        BaseLatency:    10 * time.Millisecond,
+        LatencyJitter:  5 * time.Millisecond,
+        PacketLoss:     0.0,
+        PartitionNodes: []int{},
+        Enabled:        true,
+    }
+}
+
+// NodeInfo represents public information about a node
+type NodeInfo struct {
+	ID            int       `json:"id"`
+	State         NodeState `json:"state"`
+	Term          int       `json:"term"`
+	Leader        int       `json:"leader"`
+	LogLength     int       `json:"log_length"`
+	CommitIndex   int       `json:"commit_index"`
+	LastHeartbeat time.Time `json:"last_heartbeat"`
 }

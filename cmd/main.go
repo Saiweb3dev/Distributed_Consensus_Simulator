@@ -6,71 +6,104 @@ import (
 	"time"
 	"github.com/saiweb3dev/distributed_consensus_simulator/node"
 	"github.com/saiweb3dev/distributed_consensus_simulator/types"
+	"github.com/saiweb3dev/distributed_consensus_simulator/network"
 )
-func main(){
-log.SetFlags(log.LstdFlags | log.Lshortfile)
+// SimpleNodeRegistry implements NodeRegistry for the demo
+type SimpleNodeRegistry struct {
+	nodes map[int]*node.RaftNode
+}
+
+func NewSimpleNodeRegistry() *SimpleNodeRegistry {
+	return &SimpleNodeRegistry{
+		nodes: make(map[int]*node.RaftNode),
+	}
+}
+
+func (r *SimpleNodeRegistry) AddNode(n *node.RaftNode) {
+	r.nodes[n.GetID()] = n
+}
+
+func (r *SimpleNodeRegistry) GetNode(id int) (network.NodeInterface, bool) {
+	node, exists := r.nodes[id]
+	return node, exists
+}
+
+func (r *SimpleNodeRegistry) GetAllNodes() []network.NodeInterface {
+	var nodes []network.NodeInterface
+	for _, n := range r.nodes {
+		nodes = append(nodes, n)
+	}
+	return nodes
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	
-	// Create a 3-node cluster
-	config := types.DefaultNodeConfig()
+	fmt.Println("=== Starting Raft Cluster with Network Simulation ===")
 	
-	// Node 0
-	node0 := node.NewRaftNode(0, []int{1, 2}, config)
-	// Node 1  
-	node1 := node.NewRaftNode(1, []int{0, 2}, config)
-	// Node 2
-	node2 := node.NewRaftNode(2, []int{0, 1}, config)
+	// Create network simulator
+	networkConfig := types.DefaultNetworkConfig()
+	networkSim := network.NewNetworkSimulator(networkConfig)
+	defer networkSim.Stop()
+	
+	// Create node registry
+	registry := NewSimpleNodeRegistry()
+	
+	// Create cluster router
+	router := network.NewClusterRouter(networkSim, registry)
+	
+	// Create nodes
+	nodeConfig := types.DefaultNodeConfig()
+	node0 := node.NewRaftNode(0, []int{1, 2}, nodeConfig, router)
+	node1 := node.NewRaftNode(1, []int{0, 2}, nodeConfig, router)
+	node2 := node.NewRaftNode(2, []int{0, 1}, nodeConfig, router)
+	
+	// Register nodes
+	registry.AddNode(node0)
+	registry.AddNode(node1)
+	registry.AddNode(node2)
 	
 	nodes := []*node.RaftNode{node0, node1, node2}
-
-		// Start all nodes
+	
+	// Start all nodes
 	for _, n := range nodes {
 		n.Start()
 	}
 	
-	fmt.Println("=== Raft Cluster Started ===")
-
-
-		// Simple message routing simulation
-	go func() {
-		for {
-			for _, sender := range nodes {
-				if msg, ok := sender.GetOutboxMessage(); ok {
-					// Route message to recipient
-					for _, receiver := range nodes {
-						state, _, leader := receiver.GetState()
-						if state == types.Follower && msg.To == leader {
-							log.Printf("Node %d sending message to Node %d: %s\n", getNodeID(sender), getNodeID(receiver), msg.Type)
-							break
-						}
-					}
-				}
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
-
-		// Monitor cluster state
-	for i := 0; i < 10; i++ {
+	// Monitor cluster for 15 seconds
+	for i := 0; i < 15; i++ {
 		fmt.Printf("\n=== Time: %d seconds ===\n", i)
+		
+		// Print node states
 		for _, n := range nodes {
-			state, term, leader := n.GetState()
-			fmt.Printf("Node %d: State=%s, Term=%d, Leader=%d\n", 
-				getNodeID(n), state, term, leader)
+			info := n.GetNodeInfo()
+			fmt.Printf("Node %d: %s (Term: %d, Leader: %d, Log: %d entries)\n",
+				info.ID, info.State, info.Term, info.Leader, info.LogLength)
 		}
+		
+		// Print network stats
+		sent, delivered, dropped := router.GetNetworkStats()
+		fmt.Printf("Network: Sent=%d, Delivered=%d, Dropped=%d\n", sent, delivered, dropped)
+		
+		// Simulate network partition at 5 seconds
+		if i == 5 {
+			fmt.Println("*** Creating network partition (isolating node 2) ***")
+			router.SetNetworkPartition([]int{2})
+		}
+		
+		// Heal partition at 10 seconds
+		if i == 10 {
+			fmt.Println("*** Healing network partition ***")
+			router.SetNetworkPartition([]int{})
+		}
+		
 		time.Sleep(1 * time.Second)
 	}
-
-// Stop all nodes
+	
+	// Stop all nodes
 	for _, n := range nodes {
 		n.Stop()
 	}
 	
-	fmt.Println("=== Cluster Stopped ===")
-}
-
-// Helper function to get node ID 
-func getNodeID(n *node.RaftNode) int {
-	// This is a simplified way to identify nodes for the demo
-	// In practice, we'd have a proper getter method
-	return 0 // Placeholder
+	fmt.Println("\n=== Cluster Stopped ===")
 }
