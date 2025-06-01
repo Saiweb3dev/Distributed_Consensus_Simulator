@@ -50,6 +50,10 @@ type RaftNode struct {
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
 	lastHeartbeat   time.Time
+
+	// Add for log replication
+    stateMachine map[string]interface{} // Simple key-value state machine
+    pendingCommands map[int]chan error  // Track pending client commands
 }
 
 // NewRaftNode creates a new Raft node
@@ -70,6 +74,8 @@ func NewRaftNode(id int, peers []int, config types.NodeConfig, router MessageRou
         inbox:         make(chan types.Message, 100),
         stopCh:        make(chan struct{}),
         lastHeartbeat: time.Now(),
+				stateMachine:  make(map[string]interface{}),
+        pendingCommands: make(map[int]chan error),
     }
 
     // Initialize leader state
@@ -211,19 +217,52 @@ func (n *RaftNode) handleVoteResponse(msg types.Message) {
 
 // handleAppendEntries processes append entries (including heartbeats) from leader
 func (n *RaftNode) handleAppendEntries(msg types.Message) {
-	success := true
+	success := false
 	
 	// Reset election timer since we heard from leader
 	n.resetElectionTimer()
 	n.currentLeader = msg.From
+	n.lastHeartbeat = time.Now()
 	
 	// Convert to follower if we're candidate
 	if n.state == types.Candidate {
 		n.state = types.Follower
-		n.heartbeatTicker.Stop()
+		if n.heartbeatTicker != nil {
+            n.heartbeatTicker.Stop()
+        }
 	}
 	
-	log.Printf("Node %d received %s from leader %d", n.id, msg.Type, msg.From)
+	// Check if our log contains an entry at prevLogIndex with prevLogTerm
+    if msg.PrevLogIndex == -1 || 
+       (msg.PrevLogIndex < len(n.log) && n.log[msg.PrevLogIndex].Term == msg.PrevLogTerm) {
+        
+        success = true
+        
+        // Remove conflicting entries and append new ones
+        if len(msg.Entries) > 0 {
+            // Truncate log if necessary
+            if msg.PrevLogIndex+1 < len(n.log) {
+                n.log = n.log[:msg.PrevLogIndex+1]
+            }
+            
+            // Append new entries
+            n.log = append(n.log, msg.Entries...)
+            log.Printf("Node %d appended %d entries (log length: %d)", 
+                n.id, len(msg.Entries), len(n.log))
+        }
+        
+        // Update commit index
+        if msg.LeaderCommit > n.commitIndex {
+            oldCommitIndex := n.commitIndex
+            n.commitIndex = min(msg.LeaderCommit, len(n.log)-1)
+            if n.commitIndex > oldCommitIndex {
+                log.Printf("Node %d updated commit index to %d", n.id, n.commitIndex)
+                n.applyCommittedEntries()
+            }
+        }
+    } else {
+        log.Printf("Node %d rejected append entries: log inconsistency", n.id)
+    }
 	
 	// Send response
 	response := types.Message{
@@ -232,6 +271,7 @@ func (n *RaftNode) handleAppendEntries(msg types.Message) {
 		To:      msg.From,
 		Term:    n.currentTerm,
 		Success: success,
+		MatchIndex: len(n.log) - 1,
 	}
 	
 	n.sendMessage(response)
@@ -243,25 +283,64 @@ func (n *RaftNode) handleAppendEntriesResponse(msg types.Message) {
 		return
 	}
 	
-	log.Printf("Leader %d received AppendEntriesResponse from Node %d (success: %t)", 
-		n.id, msg.From, msg.Success)
+	 // Find follower index
+    followerIndex := -1
+    for i, peer := range n.peers {
+        if peer == msg.From {
+            followerIndex = i
+            break
+        }
+    }
+    
+    if followerIndex == -1 {
+        return
+    }
+    
+    if msg.Success {
+        // Update nextIndex and matchIndex for follower
+        n.nextIndex[followerIndex] = msg.MatchIndex + 1
+        n.matchIndex[followerIndex] = msg.MatchIndex
+        
+        log.Printf("Leader %d: successful replication to node %d (matchIndex: %d)", 
+            n.id, msg.From, msg.MatchIndex)
+        
+        // Try to update commit index
+        n.updateCommitIndex()
+    } else {
+        // Decrement nextIndex and retry
+        if n.nextIndex[followerIndex] > 0 {
+            n.nextIndex[followerIndex]--
+        }
+        log.Printf("Leader %d: failed replication to node %d, retrying with nextIndex: %d", 
+            n.id, msg.From, n.nextIndex[followerIndex])
+        
+        // Immediately retry with updated nextIndex
+        n.replicateToFollower(msg.From)
+    }
 }
 
 
 // handleClientRequest processes client requests (only leaders handle these)
 func (n *RaftNode) handleClientRequest(msg types.Message) {
 	if n.state != types.Leader {
-		// Redirect to leader if known
-		if n.currentLeader != -1 {
-			log.Printf("Node %d redirecting client request to leader %d", n.id, n.currentLeader)
-		} else {
-			log.Printf("Node %d rejecting client request - no known leader", n.id)
-		}
-		return
-	}
-	
-	log.Printf("Leader %d received client request: %v", n.id, msg.Command)
-	// In Module 3, we'll implement log replication here
+        log.Printf("Node %d rejecting client request - not leader", n.id)
+        return
+    }
+
+		 // Append to log
+    logIndex := n.appendLogEntry(msg.Command)
+    
+    // Set up response channel for this command
+    respCh := make(chan error, 1)
+    n.pendingCommands[logIndex] = respCh
+    
+    // Replicate to all followers
+    for _, peer := range n.peers {
+        n.replicateToFollower(peer)
+    }
+    
+    log.Printf("Leader %d processing client request at index %d: %v", 
+        n.id, logIndex, msg.Command)
 }
 
 // handleElectionTimeout starts a new election
@@ -278,12 +357,17 @@ func (n *RaftNode) handleElectionTimeout() {
 
 // handleHeartbeatTimeout sends heartbeats to followers (leaders only)
 func (n *RaftNode) handleHeartbeatTimeout() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	
-	if n.state != types.Leader {
-		return
-	}
+	 n.mu.Lock()
+    defer n.mu.Unlock()
+    
+    if n.state != types.Leader {
+        return
+    }
+    
+    // Send heartbeats/log entries to all followers
+    for _, peer := range n.peers {
+        n.replicateToFollower(peer)
+    }
 	
 	n.sendHeartbeats()
 }

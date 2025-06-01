@@ -76,7 +76,12 @@ type Message struct {
 	Success      bool        `json:"success,omitempty"`
 	LeaderCommit int         `json:"leader_commit,omitempty"`
 	Command      interface{} `json:"command,omitempty"`
-
+   
+	// Add fields for log replication
+    PrevLogIndex int `json:"prev_log_index,omitempty"`
+    PrevLogTerm  int `json:"prev_log_term,omitempty"`
+    MatchIndex   int `json:"match_index,omitempty"`   // For tracking replication progress
+		
 	// Network simulation fields
 	Timestamp time.Time `json:"timestamp"`
 	Delay     time.Duration `json:"delay,omitempty"`

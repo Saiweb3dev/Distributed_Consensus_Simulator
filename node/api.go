@@ -64,6 +64,25 @@ func (n *RaftNode) SubmitCommand(command interface{}) error {
 	return nil
 }
 
+// GetStateMachine returns a copy of the current state machine
+func (n *RaftNode) GetStateMachine() map[string]interface{} {
+    n.mu.RLock()
+    defer n.mu.RUnlock()
+    
+    result := make(map[string]interface{})
+    for k, v := range n.stateMachine {
+        result[k] = v
+    }
+    return result
+}
+
+// GetCommitIndex returns the current commit index
+func (n *RaftNode) GetCommitIndex() int {
+    n.mu.RLock()
+    defer n.mu.RUnlock()
+    return n.commitIndex
+}
+
 // IsLeader returns true if this node is the current leader
 func (n *RaftNode) IsLeader() bool {
 	n.mu.RLock()

@@ -69,35 +69,76 @@ func main() {
 	for _, n := range nodes {
 		n.Start()
 	}
+
+	// Wait for leader election
+    time.Sleep(2 * time.Second)
+
+
+		// Submit some commands to test log replication
+    for i := 0; i < 1; i++ {
+        for _, n := range nodes {
+            if n.IsLeader() {
+                command := map[string]interface{}{
+                    "op":    "set",
+                    "key":   fmt.Sprintf("key%d", i),
+                    "value": fmt.Sprintf("value%d", i),
+                }
+                err := n.SubmitCommand(command)
+                if err == nil {
+                    fmt.Printf("Submitted command: %v\n", command)
+                }
+                break
+            }
+        }
+        time.Sleep(500 * time.Millisecond)
+    }
 	
 	// Monitor cluster for 15 seconds
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 2; i++ {
 		fmt.Printf("\n=== Time: %d seconds ===\n", i)
 		
-		// Print node states
-		for _, n := range nodes {
-			info := n.GetNodeInfo()
-			fmt.Printf("Node %d: %s (Term: %d, Leader: %d, Log: %d entries)\n",
-				info.ID, info.State, info.Term, info.Leader, info.LogLength)
-		}
-		
-		// Print network stats
-		sent, delivered, dropped := router.GetNetworkStats()
-		fmt.Printf("Network: Sent=%d, Delivered=%d, Dropped=%d\n", sent, delivered, dropped)
-		
-		// Simulate network partition at 5 seconds
-		if i == 5 {
-			fmt.Println("*** Creating network partition (isolating node 2) ***")
-			router.SetNetworkPartition([]int{2})
-		}
-		
-		// Heal partition at 10 seconds
-		if i == 10 {
-			fmt.Println("*** Healing network partition ***")
-			router.SetNetworkPartition([]int{})
-		}
-		
-		time.Sleep(1 * time.Second)
+		 // Print node states
+        for _, n := range nodes {
+            info := n.GetNodeInfo()
+            stateMachine := n.GetStateMachine()
+            fmt.Printf("Node %d: %s (Term: %d, Leader: %d, Log: %d, Commit: %d, State: %v)\n",
+                info.ID, info.State, info.Term, info.Leader, info.LogLength, 
+                n.GetCommitIndex(), stateMachine)
+        }
+        
+        // Print network stats
+        sent, delivered, dropped := router.GetNetworkStats()
+        fmt.Printf("Network: Sent=%d, Delivered=%d, Dropped=%d\n", sent, delivered, dropped)
+        
+        // Simulate network partition at 5 seconds
+        if i == 5 {
+            fmt.Println("*** Creating network partition (isolating node 2) ***")
+            router.SetNetworkPartition([]int{2})
+        }
+        
+        // Heal partition at 10 seconds
+        if i == 10 {
+            fmt.Println("*** Healing network partition ***")
+            router.SetNetworkPartition([]int{})
+        }
+        
+        // Submit additional command after partition heals
+        if i == 12 {
+            for _, n := range nodes {
+                if n.IsLeader() {
+                    command := map[string]interface{}{
+                        "op":    "set",
+                        "key":   "post_partition",
+                        "value": "healed",
+                    }
+                    n.SubmitCommand(command)
+                    fmt.Printf("Submitted post-partition command: %v\n", command)
+                    break
+                }
+            }
+        }
+        
+        time.Sleep(1 * time.Second)
 	}
 	
 	// Stop all nodes
@@ -105,5 +146,11 @@ func main() {
 		n.Stop()
 	}
 	
-	fmt.Println("\n=== Cluster Stopped ===")
+	fmt.Println("\n=== Final State Machines ===")
+    for _, n := range nodes {
+        stateMachine := n.GetStateMachine()
+        fmt.Printf("Node %d final state: %v\n", n.GetID(), stateMachine)
+    }
+    
+    fmt.Println("\n=== Cluster Stopped ===")
 }
